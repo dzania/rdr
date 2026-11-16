@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Only the latest commit of a branch or PR is worth checking. Runs on main are
+# never cancelled, so every commit there keeps a result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Actions are pinned to commit SHAs, since a tag can be moved to other code.
+jobs:
+  zig-fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          use-cache: false
+      - run: zig fmt --check build.zig src
