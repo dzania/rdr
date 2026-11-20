@@ -9,7 +9,20 @@
 
 #include <stddef.h>
 
-enum { DOC_OK = 0, DOC_E_NOMEM = -1, DOC_E_OPEN = -2, DOC_E_PAGE = -3, DOC_E_RENDER = -4 };
+enum {
+    DOC_OK = 0,
+    DOC_E_NOMEM = -1,
+    DOC_E_OPEN = -2,
+    DOC_E_PAGE = -3,
+    DOC_E_RENDER = -4,
+    DOC_E_OUTLINE = -5,
+};
+
+// Outline entries nested deeper than this are left out, with their children.
+#define DOC_OUTLINE_DEPTH_MAX 32
+// Entries after this many are left out. Real tables of contents are far
+// smaller; the cap bounds memory for a malformed or hostile document.
+#define DOC_OUTLINE_ITEMS_MAX 65536
 
 typedef struct doc doc;
 
@@ -29,6 +42,31 @@ void doc_close(doc *d);
 
 // Page size in points (1/72 inch).
 int doc_page_size(doc *d, int page, float *w_pt, float *h_pt);
+
+// One table of contents entry. Entries come in reading order (a pre-order
+// walk of the tree): depth is 0 for the first entry and grows by at most 1
+// from one entry to the next, so an entry's children are the deeper entries
+// right after it.
+typedef struct doc_outline_item {
+    // NUL-terminated UTF-8, never NULL. May contain control characters.
+    const char *title;
+    // 0-based page index below the page count, or -1 when the entry does
+    // not point into this document.
+    int page;
+    // Target position from the top of the page, in points; 0 if unknown.
+    float y;
+    // 0 <= depth < DOC_OUTLINE_DEPTH_MAX.
+    int depth;
+    // Nonzero if the document wants the entry expanded. The viewer then
+    // toggles it: the shim never reads it back.
+    int open;
+} doc_outline_item;
+
+// The table of contents, loaded on the first call and owned by d until
+// doc_close. A document without one yields *count = 0 and *items = NULL.
+// DOC_E_OUTLINE is remembered: later calls return it without parsing the
+// outline again. DOC_E_NOMEM is not, so a later call tries again.
+int doc_outline(doc *d, doc_outline_item **items, int *count);
 
 int doc_render(doc *d, int page, float scale, doc_pixmap *out);
 void doc_pixmap_drop(doc *d, doc_pixmap *pixmap);

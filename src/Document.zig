@@ -10,6 +10,10 @@ page_count: u32,
 
 pub const OpenError = error{ OutOfMemory, OpenFailed };
 pub const Error = error{ OutOfMemory, PageFailed, RenderFailed };
+pub const OutlineError = error{ OutOfMemory, OutlineFailed };
+
+/// A table of contents entry. See `doc_outline_item` in `shim.h`.
+pub const OutlineItem = shim.doc_outline_item;
 
 /// Page size in points (1/72 inch).
 pub const PageSize = struct {
@@ -54,6 +58,31 @@ pub fn pageSize(self: Document, page: u32) Error!PageSize {
     assert(size.width > 0);
     assert(size.height > 0);
     return size;
+}
+
+/// The table of contents in reading order, empty if the document has none.
+/// Loaded on the first call; the items live until `close`. Their `open`
+/// fields belong to the caller.
+pub fn outline(self: Document) OutlineError![]OutlineItem {
+    var items: [*c]OutlineItem = null;
+    var count: c_int = 0;
+    switch (shim.doc_outline(self.handle, &items, &count)) {
+        shim.DOC_OK => {},
+        shim.DOC_E_NOMEM => return error.OutOfMemory,
+        shim.DOC_E_OUTLINE => return error.OutlineFailed,
+        else => unreachable, // doc_outline returns no other status.
+    }
+    assert(count >= 0);
+    assert(count <= shim.DOC_OUTLINE_ITEMS_MAX);
+    if (count == 0) return &.{};
+    const result = items[0..@intCast(count)];
+    for (result) |item| {
+        assert(item.title != null);
+        assert(item.page >= -1);
+        assert(item.page < self.page_count);
+        assert(item.y >= 0);
+    }
+    return result;
 }
 
 /// Renders `page` at `scale` pixels per point. Release with `Pixmap.deinit`.

@@ -97,7 +97,7 @@ pub fn apply(self: *Viewport, command: Command) void {
     const line = scroll_cells * self.cell.height;
     const half_page = self.area.height / 2;
     switch (command) {
-        .quit => unreachable, // The caller exits instead.
+        .quit, .open_index => unreachable, // The caller handles them.
         .scroll_down => self.scrollDown(line),
         .scroll_up => self.scrollUp(line),
         .half_page_down => self.scrollDown(half_page),
@@ -144,6 +144,14 @@ fn goTo(self: *Viewport, page: u32) void {
     assert(page < self.page_count);
     if (page != self.page) self.y = 0;
     self.page = page;
+}
+
+/// Shows `page` from `y` pixels down its image at the current zoom. `fit`
+/// clamps `y` to the image.
+pub fn jump(self: *Viewport, page: u32, y: u32) void {
+    assert(page < self.page_count);
+    self.page = page;
+    self.y = y;
 }
 
 /// Keeps the same point of the page at the top-left corner.
@@ -250,4 +258,15 @@ test "scale fits the page width and caps large images" {
     try testing.expectEqual(capped, viewport.scale(huge));
     const bytes = 3 * (10 * capped) * (10_000 * capped);
     try testing.expect(bytes <= image_bytes_max * 1.001);
+}
+
+test "jump keeps the horizontal offset and fit clamps the target" {
+    var viewport = testViewport(0);
+    _ = viewport.fit(.{ .width = 150, .height = 300 });
+    viewport.apply(.scroll_right);
+    viewport.jump(3, 1000);
+    try testing.expectEqual(3, viewport.page);
+    const crop = viewport.fit(.{ .width = 150, .height = 300 });
+    try testing.expectEqual(100, crop.rect.y);
+    try testing.expectEqual(30, crop.rect.x);
 }
