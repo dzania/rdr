@@ -107,6 +107,7 @@ test parsePage {
 
 test {
     _ = @import("App.zig");
+    _ = @import("Index.zig");
     _ = @import("PageCache.zig");
     _ = @import("Tty.zig");
     _ = @import("Viewport.zig");
