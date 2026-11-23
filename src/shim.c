@@ -19,6 +19,10 @@ struct doc {
     fz_outline *outline;
     doc_outline_item *outline_items;
     int outline_count;
+    // The structured text of page text_page, or NULL. One page is enough:
+    // a selection never spans pages.
+    fz_stext_page *text;
+    int text_page;
 };
 
 // rdr owns the terminal while it runs, and MuPDF's default handlers would
@@ -83,6 +87,7 @@ int doc_open(const char *path, doc **out, int *page_count_out, char *message, si
 }
 
 void doc_close(doc *d) {
+    fz_drop_stext_page(d->ctx, d->text);
     free(d->outline_items);
     fz_drop_outline(d->ctx, d->outline);
     drop(d->ctx, d->document);
@@ -267,4 +272,90 @@ int doc_render(doc *d, int page, float scale, doc_pixmap *out) {
 void doc_pixmap_drop(doc *d, doc_pixmap *pixmap) {
     fz_drop_pixmap(d->ctx, pixmap->owner);
     *pixmap = (doc_pixmap){0};
+}
+
+// Makes d->text the structured text of page. The old page's text is dropped
+// first, so a failure leaves no text loaded rather than the wrong page's.
+static int load_text(doc *d, int page) {
+    if (d->text && d->text_page == page) return DOC_OK;
+    fz_context *ctx = d->ctx;
+    fz_drop_stext_page(ctx, d->text);
+    d->text = NULL;
+
+    fz_page *volatile loaded = NULL;
+    fz_stext_page *volatile text = NULL;
+    // Default flags: ligatures are split and whitespace becomes spaces,
+    // which is what a pasted selection should contain.
+    fz_stext_options options = {0};
+    fz_try(ctx) {
+        loaded = fz_load_page(ctx, d->document, page);
+        text = fz_new_stext_page_from_page(ctx, loaded, &options);
+    }
+    fz_always(ctx) {
+        fz_drop_page(ctx, loaded);
+    }
+    fz_catch(ctx) {
+        fz_ignore_error(ctx);
+        return DOC_E_TEXT;
+    }
+    d->text = text;
+    d->text_page = page;
+    return DOC_OK;
+}
+
+// Structured text uses the page's own coordinates, whose origin is the
+// mediabox corner rather than (0, 0).
+static fz_point to_text(const doc *d, doc_point p) {
+    return fz_make_point(d->text->mediabox.x0 + p.x, d->text->mediabox.y0 + p.y);
+}
+
+int doc_highlight(doc *d, int page, doc_point a, doc_point b, doc_rect *rects, int rects_max, int *count) {
+    *count = 0;
+    int status = load_text(d, page);
+    if (status != DOC_OK) return status;
+
+    // Bounded by the caller's array, so this stays on the stack. MuPDF
+    // writes at most rects_max quads.
+    enum { QUADS_MAX = 1024 };
+    fz_quad quads[QUADS_MAX];
+    int quads_max = rects_max < QUADS_MAX ? rects_max : QUADS_MAX;
+    // fz_highlight_selection walks the text without allocating, so it
+    // cannot throw.
+    int found = fz_highlight_selection(d->ctx, d->text, to_text(d, a), to_text(d, b), quads, quads_max);
+
+    float x0 = d->text->mediabox.x0;
+    float y0 = d->text->mediabox.y0;
+    int written = 0;
+    for (int i = 0; i < found && i < quads_max; i++) {
+        fz_rect r = fz_rect_from_quad(quads[i]);
+        // A degenerate font matrix can yield NaN or infinite corners.
+        if (!isfinite(r.x0) || !isfinite(r.y0) || !isfinite(r.x1) || !isfinite(r.y1)) continue;
+        if (!(r.x0 <= r.x1) || !(r.y0 <= r.y1)) continue;
+        rects[written++] = (doc_rect){.x0 = r.x0 - x0, .y0 = r.y0 - y0, .x1 = r.x1 - x0, .y1 = r.y1 - y0};
+    }
+    *count = written;
+    return DOC_OK;
+}
+
+int doc_copy(doc *d, int page, doc_point a, doc_point b, char **text) {
+    *text = NULL;
+    int status = load_text(d, page);
+    if (status != DOC_OK) return status;
+
+    fz_context *ctx = d->ctx;
+    char *volatile copied = NULL;
+    fz_try(ctx) {
+        copied = fz_copy_selection(ctx, d->text, to_text(d, a), to_text(d, b), 0);
+    }
+    fz_catch(ctx) {
+        fz_ignore_error(ctx);
+        return DOC_E_TEXT;
+    }
+    if (!copied) return DOC_E_TEXT;
+    *text = copied;
+    return DOC_OK;
+}
+
+void doc_text_drop(doc *d, char *text) {
+    fz_free(d->ctx, text);
 }

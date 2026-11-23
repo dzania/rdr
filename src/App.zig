@@ -8,6 +8,8 @@ const Index = @import("Index.zig");
 const PageCache = @import("PageCache.zig");
 const Tty = @import("Tty.zig");
 const Viewport = @import("Viewport.zig");
+const clipboard = @import("clipboard.zig");
+const highlight = @import("highlight.zig");
 const input = @import("input.zig");
 const kitty = @import("kitty.zig");
 const assert = std.debug.assert;
@@ -21,31 +23,66 @@ medium: kitty.Medium,
 size: Tty.Size,
 viewport: Viewport,
 cache: PageCache = .{},
+/// What `Tty.enter`'s mouse reports count.
+mouse_units: Tty.MouseUnits,
 /// The image whose placement is on screen.
-shown: ?kitty.ImageId = null,
+shown: ?PageCache.Entry = null,
 mode: Mode = .page,
 /// Made on the first `Tab`, so a document whose outline is never opened
 /// does not load it. Kept after closing, with its expanded entries.
 index: ?Index = null,
 /// Replaces the status line until the next command.
-notice: ?[]const u8 = null,
+notice: ?Notice = null,
+/// Text being or last selected with the mouse. Drawn while its page is on
+/// screen; a new press or Escape drops it.
+selection: ?Selection = null,
+/// The terminal holds the highlight tile.
+highlight_sent: bool = false,
+/// Highlight placements are on screen.
+highlight_shown: bool = false,
+/// The selection changed since the last `draw`.
+redraw: bool = false,
 decoder: input.Decoder = .{},
 parser: input.Parser = .{},
 
 const Mode = enum { page, index };
 const Next = enum { run, quit };
 
+const Notice = union(enum) {
+    text: []const u8,
+    /// Characters sent to the clipboard.
+    copied: usize,
+};
+
+/// Kept in page points, so it stays on the same text across scrolling,
+/// zoom, and resizes.
+const Selection = struct {
+    page: u32,
+    /// Where the drag started.
+    anchor: Document.Point,
+    /// Where it is now, or ended.
+    head: Document.Point,
+    dragging: bool,
+};
+
+/// Highlight rectangles per frame. One per selected line, so a full pane of
+/// small print fits.
+const highlight_rects_max = 512;
+
 pub const Error = Document.Error || kitty.Error;
 
 /// Probes the terminal, so the tty must already be in the alternate screen.
 pub fn init(tty: Tty, out: *std.Io.Writer, doc: Document, title: []const u8, first_page: u32) Error!App {
     const size = try tty.size();
+    const medium: kitty.Medium = try .probe(tty, out);
+    const mouse_units = try tty.probeMouseUnits();
     return .{
         .tty = tty,
         .out = out,
         .doc = doc,
         .title = title,
-        .medium = try .probe(tty, out),
+        .medium = medium,
+        .mouse_units = mouse_units,
         .size = size,
         .viewport = .init(first_page, doc.page_count, size),
     };
@@ -58,6 +95,10 @@ pub fn deinit(self: *App) void {
         // Best effort on the way out: the terminal may already be gone.
         kitty.delete(self.out, entry.id) catch {};
         self.medium.remove(entry.id);
+    }
+    if (self.highlight_sent) {
+        kitty.delete(self.out, .highlight) catch {};
+        self.medium.remove(.highlight);
     }
     self.out.flush() catch {};
 }
@@ -77,6 +118,7 @@ pub fn run(self: *App) Error!void {
             for (bytes) |byte| {
                 const keys = self.decoder.feed(byte);
                 if (keys.escape) try self.escapeKey();
+                if (keys.mouse) |event| try self.mouse(event);
                 const key = keys.byte orelse continue;
                 const next = switch (self.mode) {
                     .page => try self.pageKey(key),
@@ -85,17 +127,124 @@ pub fn run(self: *App) Error!void {
                 if (next == .quit) return;
             }
             if (self.decoder.flush()) try self.escapeKey();
+            // A drag reports every pixel moved, so the highlight is
+            // redrawn once per read rather than once per report.
+            if (self.redraw) try self.draw();
         },
     };
 }
 
-/// Escape closes the index, and in either mode drops a pending `g`.
+/// Escape closes the index or drops the selection, and in either mode
+/// drops a pending `g`.
 fn escapeKey(self: *App) Error!void {
     self.parser.reset();
-    if (self.mode != .index) return;
+    switch (self.mode) {
+        .index => try self.closeIndex(),
+        .page => {
+            if (self.selection == null) return;
+            self.selection = null;
+        },
+    }
     self.notice = null;
-    try self.closeIndex();
     try self.draw();
+}
+
+fn mouse(self: *App, event: input.Mouse) Error!void {
+    switch (event.action) {
+        .wheel_up, .wheel_down => try self.wheel(event.action == .wheel_up),
+        .press, .drag, .release => try self.selectText(event),
+    }
+}
+
+/// Scrolls like `k` and `j`, or moves the index selection.
+fn wheel(self: *App, up: bool) Error!void {
+    self.parser.reset();
+    self.notice = null;
+    switch (self.mode) {
+        .page => self.viewport.apply(if (up) .scroll_up else .scroll_down),
+        .index => self.index.?.apply(if (up) .up else .down),
+    }
+    try self.draw();
+}
+
+/// A press starts a selection on the page shown, a drag extends it, and
+/// the release copies its text. Redrawn after the read, by `run`.
+fn selectText(self: *App, event: input.Mouse) Error!void {
+    if (self.mode != .page) return;
+    const image = self.shown orelse return;
+    const point = self.pagePoint(event, image.scale);
+    switch (event.action) {
+        .press => {
+            self.parser.reset();
+            self.notice = null;
+            self.selection = .{ .page = image.page, .anchor = point, .head = point, .dragging = true };
+        },
+        .drag, .release => {
+            const selection = if (self.selection) |*selection| selection else return;
+            if (!selection.dragging) return;
+            if (selection.page != image.page) {
+                // A key turned the page mid-drag.
+                self.selection = null;
+            } else {
+                selection.head = point;
+                if (event.action == .release) {
+                    selection.dragging = false;
+                    try self.copySelection();
+                }
+            }
+        },
+        .wheel_up, .wheel_down => unreachable, // `mouse` handles the wheel.
+    }
+    self.redraw = true;
+}
+
+/// Sends the finished selection's text to the clipboard. A click without a
+/// drag, or a drag over no text, just drops the selection.
+fn copySelection(self: *App) Error!void {
+    const selection = self.selection.?;
+    assert(!selection.dragging);
+    if (selection.anchor.x == selection.head.x and selection.anchor.y == selection.head.y) {
+        self.selection = null;
+        return;
+    }
+    var text = self.doc.copy(selection.page, selection.anchor, selection.head) catch |err| switch (err) {
+        error.TextFailed => {
+            self.selection = null;
+            self.notice = .{ .text = text_failed };
+            return;
+        },
+    };
+    defer text.deinit(self.doc);
+    if (text.bytes.len == 0) {
+        self.selection = null;
+        self.notice = .{ .text = "no text selected" };
+        return;
+    }
+    if (text.bytes.len > clipboard.bytes_max) {
+        self.notice = .{ .text = "selection too long to copy" };
+        return;
+    }
+    try clipboard.write(self.out, text.bytes);
+    self.notice = .{ .copied = clipboard.countChars(text.bytes) };
+}
+
+const text_failed = "cannot read the text on this page";
+
+/// The page position under a mouse report, through the image on screen.
+fn pagePoint(self: *App, event: input.Mouse, scale: f32) Document.Point {
+    assert(scale > 0);
+    const pane: Viewport.Point = switch (self.mouse_units) {
+        // Taken as 1-based like cells. A terminal counting from 0 puts the
+        // point one pixel off, which no selection notices.
+        .pixels => .{ .x = event.x -| 1, .y = event.y -| 1 },
+        .cells => self.viewport.cellCentre(event.x, event.y),
+    };
+    const pixel = self.viewport.imagePoint(pane);
+    // The pixel's centre.
+    return .{
+        .x = (@as(f32, @floatFromInt(pixel.x)) + 0.5) / scale,
+        .y = (@as(f32, @floatFromInt(pixel.y)) + 0.5) / scale,
+    };
 }
 
 fn pageKey(self: *App, byte: u8) Error!Next {
@@ -130,12 +279,12 @@ fn openIndex(self: *App) Error!void {
         const items = self.doc.outline() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.OutlineFailed => {
-                self.notice = "cannot read the table of contents";
+                self.notice = .{ .text = "cannot read the table of contents" };
                 return;
             },
         };
         if (items.len == 0) {
-            self.notice = "no table of contents";
+            self.notice = .{ .text = "no table of contents" };
             return;
         }
         self.index = .init(items);
@@ -143,6 +292,11 @@ fn openIndex(self: *App) Error!void {
     self.index.?.reveal(self.viewport.page);
     self.mode = .index;
     self.parser.reset();
+    // The index ignores the mouse, so an unfinished drag would never see
+    // its release.
+    if (self.selection) |selection| {
+        if (selection.dragging) self.selection = null;
+    }
 }
 
 fn closeIndex(self: *App) Error!void {
@@ -156,7 +310,7 @@ fn closeIndex(self: *App) Error!void {
 fn select(self: *App) Error!void {
     const item = self.index.?.selectedItem();
     if (item.page < 0) {
-        self.notice = "this entry points outside the document";
+        self.notice = .{ .text = "this entry points outside the document" };
         return;
     }
     const page: u32 = @intCast(item.page);
@@ -164,7 +318,7 @@ fn select(self: *App) Error!void {
         // A damaged page should not end the session: the index stays open
         // so another entry can be picked.
         error.PageFailed => {
-            self.notice = "cannot open this entry's page";
+            self.notice = .{ .text = "cannot open this entry's page" };
             return;
         },
         else => return err,
@@ -192,6 +346,7 @@ fn clearRows(self: *App) Error!void {
 }
 
 fn draw(self: *App) Error!void {
+    self.redraw = false;
     switch (self.mode) {
         .page => try self.drawPage(),
         .index => try self.drawIndex(),
@@ -204,18 +359,73 @@ fn drawPage(self: *App) Error!void {
     const image = try self.pageImage();
     const crop = self.viewport.fit(.{ .width = image.width, .height = image.height });
     if (self.shown) |shown| {
-        if (shown != image.id) try kitty.unplace(self.out, shown);
+        if (shown.id != image.id) try kitty.unplace(self.out, shown.id);
     }
     try self.out.print("\x1b[1;{d}H", .{crop.column});
     try kitty.place(self.out, image.id, crop.rect);
-    self.shown = image.id;
+    self.shown = image;
+    try self.drawHighlight(image);
+}
+
+/// Covers the selected text on the page shown, replacing any earlier
+/// highlight. `fit` must have run for `image`.
+fn drawHighlight(self: *App, image: PageCache.Entry) Error!void {
+    try self.clearHighlight();
+    const selection = self.selection orelse return;
+    if (selection.page != image.page) return;
+    var rects: [highlight_rects_max]Document.Rect = undefined;
+    const found = self.doc.highlight(image.page, selection.anchor, selection.head, &rects) catch |err| switch (err) {
+        error.TextFailed => {
+            self.selection = null;
+            self.notice = .{ .text = text_failed };
+            return;
+        },
+    };
+    if (found.len == 0) return;
+    if (!self.highlight_sent) {
+        try highlight.transmit(self.out, self.medium);
+        self.highlight_sent = true;
+    }
+    var placement: u32 = 1;
+    for (found) |rect| {
+        const pane = self.viewport.paneRect(imageRect(rect, image)) orelse continue;
+        placement = try highlight.place(self.out, pane, self.viewport.cell.width, self.viewport.cell.height, placement);
+    }
+    self.highlight_shown = placement > 1;
+}
+
+fn clearHighlight(self: *App) Error!void {
+    if (!self.highlight_shown) return;
+    try kitty.unplaceAll(self.out, .highlight);
+    self.highlight_shown = false;
+}
+
+/// `rect`, in page points, as whole pixels of `image`: rounded outwards
+/// and clamped to the image.
+fn imageRect(rect: Document.Rect, image: PageCache.Entry) kitty.Rect {
+    const x0 = toPixel(@floor(rect.x0 * image.scale), image.width);
+    const y0 = toPixel(@floor(rect.y0 * image.scale), image.height);
+    const x1 = toPixel(@ceil(rect.x1 * image.scale), image.width);
+    const y1 = toPixel(@ceil(rect.y1 * image.scale), image.height);
+    assert(x0 <= x1);
+    assert(y0 <= y1);
+    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
+
+/// `value` clamped to 0 through `limit`. Handles an infinite product of a
+/// huge coordinate and the scale.
+fn toPixel(value: f32, limit: u32) u32 {
+    if (!(value > 0)) return 0;
+    if (value >= @as(f32, @floatFromInt(limit))) return limit;
+    return @intFromFloat(value);
 }
 
 /// One entry per row above the status line. The page image is hidden but
 /// stays in the terminal for when the index closes.
 fn drawIndex(self: *App) Error!void {
+    try self.clearHighlight();
     if (self.shown) |shown| {
-        try kitty.unplace(self.out, shown);
+        try kitty.unplace(self.out, shown.id);
         self.shown = null;
     }
     const index = &self.index.?;
@@ -403,7 +613,9 @@ fn pageImage(self: *App) Error!PageCache.Entry {
     const entry, const evicted = self.cache.insert(page, scale, pixmap.width, pixmap.height);
     if (evicted) |id| {
         try kitty.delete(self.out, id);
-        if (self.shown == id) self.shown = null;
+        if (self.shown) |shown| {
+            if (shown.id == id) self.shown = null;
+        }
     }
     const image: kitty.Image = .{ .pixels = pixmap.pixels, .width = pixmap.width, .height = pixmap.height };
     try kitty.transmit(self.out, self.medium, entry.id, image, .quiet);
@@ -415,8 +627,9 @@ fn drawStatus(self: *App) Error!void {
     var status: std.Io.Writer = .fixed(&buffer);
     // A title too long for the buffer is cut off, which the pane width
     // would do anyway.
-    if (self.notice) |notice| {
-        status.print(" {s}", .{notice}) catch {};
+    if (self.notice) |notice| switch (notice) {
+        .text => |text| status.print(" {s}", .{text}) catch {},
+        .copied => |count| status.print(" copied {d} character{s}", .{ count, if (count == 1) "" else "s" }) catch {},
     } else switch (self.mode) {
         .page => status.print(" {s}  {d} / {d}  {d:.0}%", .{
             self.title,
@@ -498,4 +711,21 @@ test columnWidth {
     try std.testing.expectEqual(2, columnWidth(0x1f600)); // Grinning face.
     try std.testing.expectEqual(2, columnWidth(0x20000));
     try std.testing.expectEqual(1, columnWidth(0x10ffff));
+}
+
+test imageRect {
+    const image: PageCache.Entry = .{ .id = @fromBackingInt(3), .page = 0, .scale = 2, .width = 100, .height = 50 };
+    try std.testing.expectEqual(
+        kitty.Rect{ .x = 2, .y = 4, .width = 9, .height = 7 },
+        imageRect(.{ .x0 = 1.2, .y0 = 2, .x1 = 5.4, .y1 = 5.1 }, image),
+    );
+    // Clamped to the image, including an infinite product.
+    try std.testing.expectEqual(
+        kitty.Rect{ .x = 0, .y = 40, .width = 100, .height = 10 },
+        imageRect(.{ .x0 = -3, .y0 = 20, .x1 = std.math.floatMax(f32), .y1 = 99 }, image),
+    );
+    try std.testing.expectEqual(
+        kitty.Rect{ .x = 100, .y = 50, .width = 0, .height = 0 },
+        imageRect(.{ .x0 = 60, .y0 = 30, .x1 = 70, .y1 = 40 }, image),
+    );
 }

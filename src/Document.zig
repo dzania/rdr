@@ -11,6 +11,25 @@ page_count: u32,
 pub const OpenError = error{ OutOfMemory, OpenFailed };
 pub const Error = error{ OutOfMemory, PageFailed, RenderFailed };
 pub const OutlineError = error{ OutOfMemory, OutlineFailed };
+/// MuPDF could not extract the page's text.
+pub const TextError = error{TextFailed};
+
+/// A position on a page in points from its top-left corner, the space
+/// `pageSize` measures. Multiply by a render scale to get image pixels.
+pub const Point = shim.doc_point;
+/// An area of a page in the same space as `Point`.
+pub const Rect = shim.doc_rect;
+
+/// Selected text: NUL-terminated UTF-8 owned by MuPDF.
+pub const Text = struct {
+    bytes: [:0]const u8,
+    raw: [*c]u8,
+
+    pub fn deinit(self: *Text, doc: Document) void {
+        shim.doc_text_drop(doc.handle, self.raw);
+        self.* = undefined;
+    }
+};
 
 /// A table of contents entry. See `doc_outline_item` in `shim.h`.
 pub const OutlineItem = shim.doc_outline_item;
@@ -96,6 +115,53 @@ pub fn render(self: Document, page: u32, scale: f32) Error!Pixmap {
     assert(width > 0);
     assert(height > 0);
     return .{ .pixels = raw.samples[0 .. @as(usize, width) * height * 3], .width = width, .height = height, .raw = raw };
+}
+
+/// Rectangles covering the text from `a` to `b` on `page` in reading order,
+/// roughly one per line. A selection needing more than `rects.len` is cut
+/// short. Extracts the page's text on the first call for that page.
+pub fn highlight(self: Document, page: u32, a: Point, b: Point, rects: []Rect) TextError![]Rect {
+    assert(page < self.page_count);
+    assert(rects.len > 0);
+    assert(rects.len <= std.math.maxInt(c_int));
+    assertFinite(a);
+    assertFinite(b);
+    var count: c_int = 0;
+    try checkText(shim.doc_highlight(self.handle, @intCast(page), a, b, rects.ptr, @intCast(rects.len), &count));
+    assert(count >= 0);
+    assert(count <= rects.len);
+    const result = rects[0..@intCast(count)];
+    for (result) |rect| {
+        assert(rect.x0 <= rect.x1);
+        assert(rect.y0 <= rect.y1);
+    }
+    return result;
+}
+
+/// The text from `a` to `b` on `page` in reading order, with "\n" line
+/// endings; empty when the selection holds no text. Release with
+/// `Text.deinit`.
+pub fn copy(self: Document, page: u32, a: Point, b: Point) TextError!Text {
+    assert(page < self.page_count);
+    assertFinite(a);
+    assertFinite(b);
+    var raw: [*c]u8 = null;
+    try checkText(shim.doc_copy(self.handle, @intCast(page), a, b, &raw));
+    assert(raw != null);
+    return .{ .bytes = std.mem.span(@as([*:0]const u8, @ptrCast(raw))), .raw = raw };
+}
+
+fn assertFinite(point: Point) void {
+    assert(std.math.isFinite(point.x));
+    assert(std.math.isFinite(point.y));
+}
+
+fn checkText(status: c_int) TextError!void {
+    return switch (status) {
+        shim.DOC_OK => {},
+        shim.DOC_E_TEXT => error.TextFailed,
+        else => unreachable, // doc_highlight and doc_copy return no other status.
+    };
 }
 
 fn check(status: c_int) Error!void {

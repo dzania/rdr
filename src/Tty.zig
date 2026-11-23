@@ -76,8 +76,17 @@ pub fn close(self: *Tty) void {
     _ = c.close(self.file.handle);
 }
 
-/// Switches to raw mode and the alternate screen and hides the cursor.
-/// `restore` undoes all three.
+/// Mouse reporting: button presses and drags (1002) in SGR form (1006),
+/// with pixel coordinates where the terminal supports them (1016). See
+/// `probeMouseUnits`.
+const mouse_on = "\x1b[?1002h\x1b[?1006h\x1b[?1016h";
+const mouse_off = "\x1b[?1016l\x1b[?1006l\x1b[?1002l";
+
+/// What mouse report coordinates count.
+pub const MouseUnits = enum { cells, pixels };
+
+/// Switches to raw mode and the alternate screen, hides the cursor, and
+/// turns on mouse reporting. `restore` undoes all four.
 pub fn enter(self: *Tty) Error!void {
     assert(self.saved_termios == null);
     const saved = posix.tcgetattr(self.file.handle) catch return error.TtyUnavailable;
@@ -95,7 +104,7 @@ pub fn enter(self: *Tty) Error!void {
     assert(entered == null);
     entered = self;
 
-    self.file.writeStreamingAll(self.io, "\x1b[?1049h\x1b[?25l") catch {
+    self.file.writeStreamingAll(self.io, "\x1b[?1049h\x1b[?25l" ++ mouse_on) catch {
         self.restore();
         return error.TtyUnavailable;
     };
@@ -116,7 +125,7 @@ pub fn restore(self: *Tty) void {
     // Cleared first: a panic inside this function must not restore again.
     entered = null;
     // Best effort: if the terminal is gone there is nothing to restore.
-    self.file.writeStreamingAll(self.io, "\x1b[?25h\x1b[?1049l") catch {};
+    self.file.writeStreamingAll(self.io, mouse_off ++ "\x1b[?25h\x1b[?1049l") catch {};
     posix.tcsetattr(self.file.handle, .FLUSH, saved) catch {};
     self.saved_termios = null;
 }
@@ -150,6 +159,61 @@ pub fn wait(self: Tty) Error!Event {
         }
         return result;
     }
+}
+
+/// Asks whether the terminal took SGR-pixel mouse mode, which `enter`
+/// requested. A terminal without it ignores the request and reports cells,
+/// and nothing in a report tells the two apart, so the mode is queried with
+/// DECRQM. Not every terminal answers DECRQM, so a DA1 query follows: every
+/// terminal answers that, and in order, so its reply ends the wait. Falls
+/// back to cells if the replies do not come. Must run after `enter`.
+pub fn probeMouseUnits(self: Tty) Error!MouseUnits {
+    assert(self.saved_termios != null);
+    self.file.writeStreamingAll(self.io, "\x1b[?1016$p\x1b[c") catch return error.TtyUnavailable;
+    var buffer: [256]u8 = undefined;
+    var len: usize = 0;
+    while (len < buffer.len) {
+        const bytes = try self.read(buffer[len..]);
+        if (bytes.len == 0) return .cells; // Timed out.
+        len += bytes.len;
+        if (parseProbeReplies(buffer[0..len])) |units| return units;
+    }
+    return .cells;
+}
+
+/// The units the DECRQM reply reports for mode 1016, once the DA1 reply
+/// that follows it has arrived; null until then. Other bytes, such as a
+/// mouse report sent during the probe, are skipped.
+fn parseProbeReplies(bytes: []const u8) ?MouseUnits {
+    var units: MouseUnits = .cells;
+    var rest = bytes;
+    while (std.mem.indexOf(u8, rest, "\x1b[?")) |start| {
+        rest = rest[start + 3 ..];
+        const params_len = std.mem.indexOfNone(u8, rest, "0123456789;") orelse return null;
+        const params = rest[0..params_len];
+        rest = rest[params_len..];
+        // DA1: ESC [ ? <params> c.
+        if (rest[0] == 'c') return units;
+        // DECRPM: ESC [ ? 1016 ; <state> $ y, where 1 is set and 3 is
+        // permanently set.
+        if (rest.len < 2) return null;
+        if (std.mem.startsWith(u8, rest, "$y")) {
+            if (std.mem.eql(u8, params, "1016;1") or std.mem.eql(u8, params, "1016;3")) units = .pixels;
+        }
+    }
+    return null;
+}
+
+test parseProbeReplies {
+    const da1 = "\x1b[?62;22c";
+    try std.testing.expectEqual(.pixels, parseProbeReplies("\x1b[?1016;1$y" ++ da1));
+    try std.testing.expectEqual(.cells, parseProbeReplies("\x1b[?1016;0$y" ++ da1));
+    try std.testing.expectEqual(.cells, parseProbeReplies(da1));
+    // A mouse report in between is skipped.
+    try std.testing.expectEqual(.pixels, parseProbeReplies("\x1b[?1016;1$y\x1b[<0;5;5M" ++ da1));
+    // Incomplete: wait for more.
+    try std.testing.expectEqual(null, parseProbeReplies("\x1b[?1016;1$"));
+    try std.testing.expectEqual(null, parseProbeReplies("\x1b[?1016;1$y\x1b[?62;2"));
 }
 
 /// Reads available input, waiting up to `read_timeout_ds` for the first
