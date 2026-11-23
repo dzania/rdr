@@ -9,18 +9,41 @@ const posix = std.posix;
 const Writer = std.Io.Writer;
 const Tty = @import("Tty.zig");
 
-/// Image ids are nonzero. `probe` is used once at startup; page images take
-/// the ids after it.
+/// Image ids are nonzero. `probe` is used once at startup, `highlight` is
+/// the selection tile, and page images take the ids after them.
 pub const ImageId = enum(u32) {
     probe = 1,
+    highlight = 2,
     _,
 };
 
-/// Packed 8-bit RGB pixels.
+/// Packed 8-bit pixels, rows without padding.
 pub const Image = struct {
     pixels: []const u8,
     width: u32,
     height: u32,
+    format: Format = .rgb,
+};
+
+pub const Format = enum {
+    rgb,
+    /// Not premultiplied.
+    rgba,
+
+    pub fn bytesPerPixel(self: Format) usize {
+        return switch (self) {
+            .rgb => 3,
+            .rgba => 4,
+        };
+    }
+
+    /// The `f` key's value.
+    fn bits(self: Format) u8 {
+        return switch (self) {
+            .rgb => 24,
+            .rgba => 32,
+        };
+    }
 };
 
 /// A rectangle of an image, in pixels.
@@ -116,7 +139,7 @@ pub const Response = enum { quiet, reply };
 pub fn transmit(out: *Writer, medium: Medium, id: ImageId, image: Image, response: Response) (Writer.Error || error{StoreFailed})!void {
     assert(image.width > 0);
     assert(image.height > 0);
-    assert(image.pixels.len == @as(usize, image.width) * image.height * 3);
+    assert(image.pixels.len == @as(usize, image.width) * image.height * image.format.bytesPerPixel());
 
     var name_buffer: [64]u8 = undefined;
     const name = medium.objectName(id, &name_buffer);
@@ -125,8 +148,9 @@ pub fn transmit(out: *Writer, medium: Medium, id: ImageId, image: Image, respons
     try medium.store(name, image.pixels);
 
     var encoded: [std.base64.standard.Encoder.calcSize(name_buffer.len)]u8 = undefined;
-    try out.print("\x1b_Ga=t,i={d},f=24,s={d},v={d},t={c}{s};{s}\x1b\\", .{
+    try out.print("\x1b_Ga=t,i={d},f={d},s={d},v={d},t={c}{s};{s}\x1b\\", .{
         @backingInt(id),
+        image.format.bits(),
         image.width,
         image.height,
         medium.key(),
@@ -143,6 +167,29 @@ pub fn place(out: *Writer, id: ImageId, rect: Rect) Writer.Error!void {
     try out.print("\x1b_Ga=p,i={d},p=1,x={d},y={d},w={d},h={d},C=1,q=2\x1b\\", .{
         @backingInt(id), rect.x, rect.y, rect.width, rect.height,
     });
+}
+
+/// Shows `rect` of image `id` like `place`, but as placement `placement`,
+/// shifted right and down by `offset_x` and `offset_y` pixels within the
+/// cursor's cell, and above images with a lower `z`.
+pub fn placeOverlay(out: *Writer, id: ImageId, placement: u32, rect: Rect, offset: Offset) Writer.Error!void {
+    assert(placement > 0);
+    try out.print("\x1b_Ga=p,i={d},p={d},x={d},y={d},w={d},h={d},X={d},Y={d},z={d},C=1,q=2\x1b\\", .{
+        @backingInt(id), placement, rect.x, rect.y, rect.width, rect.height, offset.x, offset.y, offset.z,
+    });
+}
+
+/// Where `placeOverlay` puts an image relative to the cursor's cell. kitty
+/// requires `x` and `y` to be smaller than the cell.
+pub const Offset = struct {
+    x: u32,
+    y: u32,
+    z: i32,
+};
+
+/// Removes every placement of image `id` but keeps the image.
+pub fn unplaceAll(out: *Writer, id: ImageId) Writer.Error!void {
+    try out.print("\x1b_Ga=d,d=i,i={d},q=2\x1b\\", .{@backingInt(id)});
 }
 
 /// Removes the placement of image `id` but keeps the image for later use.

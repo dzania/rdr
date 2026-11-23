@@ -20,7 +20,7 @@ pub const Entry = struct {
 
 /// Most recently used first; empty slots are at the end.
 entries: [capacity]?Entry = @splat(null),
-next_id: u32 = @backingInt(kitty.ImageId.probe) + 1,
+next_id: u32 = @backingInt(kitty.ImageId.highlight) + 1,
 
 pub fn get(self: *PageCache, page: u32, scale: f32) ?Entry {
     for (self.entries, 0..) |slot, index| {
@@ -56,11 +56,12 @@ test "get finds an image only at the same page and scale" {
     try testing.expectEqual(null, cache.get(5, 1.5));
 }
 
-test "ids are fresh and never the probe id" {
+test "ids are fresh and never a reserved id" {
     var cache: PageCache = .{};
     const first = cache.insert(0, 1, 1, 1)[0].id;
     const second = cache.insert(1, 1, 1, 1)[0].id;
     try testing.expect(first != kitty.ImageId.probe);
+    try testing.expect(first != kitty.ImageId.highlight);
     try testing.expect(first != second);
 }
 

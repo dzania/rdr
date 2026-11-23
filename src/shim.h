@@ -16,6 +16,7 @@ enum {
     DOC_E_PAGE = -3,
     DOC_E_RENDER = -4,
     DOC_E_OUTLINE = -5,
+    DOC_E_TEXT = -6,
 };
 
 // Outline entries nested deeper than this are left out, with their children.
@@ -70,5 +71,34 @@ int doc_outline(doc *d, doc_outline_item **items, int *count);
 
 int doc_render(doc *d, int page, float scale, doc_pixmap *out);
 void doc_pixmap_drop(doc *d, doc_pixmap *pixmap);
+
+// Text selection. Points and rectangles are in points (1/72 inch) from the
+// top-left corner of the page, the space doc_page_size measures, so the
+// caller can map them to a page image by multiplying by its render scale.
+// The page's text is extracted by the first call for that page and kept
+// until a call for another page or doc_close. Callers pass finite points.
+typedef struct doc_point {
+    float x;
+    float y;
+} doc_point;
+
+// x0 <= x1 and y0 <= y1, all finite.
+typedef struct doc_rect {
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+} doc_rect;
+
+// Rectangles covering the text from a to b in reading order, roughly one
+// per line, written to rects. Sets *count to at most rects_max; a selection
+// that needs more is cut short. rects_max must be positive.
+int doc_highlight(doc *d, int page, doc_point a, doc_point b, doc_rect *rects, int rects_max, int *count);
+
+// The text from a to b in reading order, as NUL-terminated UTF-8 with "\n"
+// line endings, never NULL. Empty when the selection holds no text.
+// Release with doc_text_drop.
+int doc_copy(doc *d, int page, doc_point a, doc_point b, char **text);
+void doc_text_drop(doc *d, char *text);
 
 #endif

@@ -86,11 +86,63 @@ pub fn fit(self: *Viewport, image: Size) Crop {
     const height = @min(image.height, self.area.height);
     self.x = @min(self.x, image.width - width);
     self.y = @min(self.y, image.height - height);
+    return self.shownCrop();
+}
+
+/// The part of the image on screen, as `fit` last returned it.
+fn shownCrop(self: Viewport) Crop {
+    assert(self.image.width > 0);
+    assert(self.image.height > 0);
+    const width = @min(self.image.width, self.area.width);
+    const height = @min(self.image.height, self.area.height);
+    assert(self.x + width <= self.image.width);
+    assert(self.y + height <= self.image.height);
     return .{
         // A page narrower than the pane is centred to the nearest cell.
         .column = (self.area.width - width) / 2 / self.cell.width + 1,
         .rect = .{ .x = self.x, .y = self.y, .width = width, .height = height },
     };
+}
+
+/// A position on the pane in pixels from its top-left corner.
+pub const Point = struct {
+    x: u32,
+    y: u32,
+};
+
+/// The centre of the cell at 1-based `column` and `row`.
+pub fn cellCentre(self: Viewport, column: u32, row: u32) Point {
+    return .{
+        .x = (column -| 1) *| self.cell.width +| self.cell.width / 2,
+        .y = (row -| 1) *| self.cell.height +| self.cell.height / 2,
+    };
+}
+
+/// The image pixel under `point`, clamped to the part of the image on
+/// screen, so a point beside the page or on the status line gives the
+/// nearest pixel shown. `fit` must have run.
+pub fn imagePoint(self: Viewport, point: Point) Point {
+    const shown = self.shownCrop();
+    const left = (shown.column - 1) * self.cell.width;
+    const x = std.math.clamp(point.x, left, left + shown.rect.width - 1) - left;
+    const y = @min(point.y, shown.rect.height - 1);
+    return .{ .x = shown.rect.x + x, .y = shown.rect.y + y };
+}
+
+/// The part of `rect`, in image pixels, that is on screen, in pane pixels.
+/// Null if none of it is. `fit` must have run.
+pub fn paneRect(self: Viewport, rect: kitty.Rect) ?kitty.Rect {
+    const shown = self.shownCrop();
+    const x0 = @max(rect.x, shown.rect.x);
+    const y0 = @max(rect.y, shown.rect.y);
+    const x1 = @min(rect.x +| rect.width, shown.rect.x + shown.rect.width);
+    const y1 = @min(rect.y +| rect.height, shown.rect.y + shown.rect.height);
+    if (x0 >= x1 or y0 >= y1) return null;
+    const left = (shown.column - 1) * self.cell.width;
+    const result: kitty.Rect = .{ .x = left + x0 - shown.rect.x, .y = y0 - shown.rect.y, .width = x1 - x0, .height = y1 - y0 };
+    assert(result.x + result.width <= self.area.width);
+    assert(result.y + result.height <= self.area.height);
+    return result;
 }
 
 pub fn apply(self: *Viewport, command: Command) void {
@@ -269,4 +321,39 @@ test "jump keeps the horizontal offset and fit clamps the target" {
     const crop = viewport.fit(.{ .width = 150, .height = 300 });
     try testing.expectEqual(100, crop.rect.y);
     try testing.expectEqual(30, crop.rect.x);
+}
+
+test "imagePoint follows the scroll offset and clamps to the crop" {
+    var viewport = testViewport(0);
+    _ = viewport.fit(.{ .width = 150, .height = 300 });
+    viewport.apply(.scroll_right);
+    viewport.apply(.scroll_down);
+    _ = viewport.fit(.{ .width = 150, .height = 300 });
+    try testing.expectEqual(Point{ .x = 30 + 12, .y = 60 + 34 }, viewport.imagePoint(.{ .x = 12, .y = 34 }));
+    // The status line row and beyond clamp to the last shown pixel.
+    try testing.expectEqual(Point{ .x = 30 + 99, .y = 60 + 199 }, viewport.imagePoint(.{ .x = 500, .y = 205 }));
+}
+
+test "imagePoint and paneRect account for a centred page" {
+    var viewport = testViewport(0);
+    // 40 px wide in a 100 px area: drawn from column 4, pixel 30.
+    _ = viewport.fit(.{ .width = 40, .height = 100 });
+    try testing.expectEqual(Point{ .x = 0, .y = 0 }, viewport.imagePoint(.{ .x = 0, .y = 0 }));
+    try testing.expectEqual(Point{ .x = 5, .y = 7 }, viewport.imagePoint(.{ .x = 35, .y = 7 }));
+    try testing.expectEqual(Point{ .x = 39, .y = 99 }, viewport.imagePoint(.{ .x = 99, .y = 150 }));
+    const rect = viewport.paneRect(.{ .x = 5, .y = 7, .width = 10, .height = 3 }).?;
+    try testing.expectEqual(kitty.Rect{ .x = 35, .y = 7, .width = 10, .height = 3 }, rect);
+}
+
+test "paneRect clips to the crop and drops what is off screen" {
+    var viewport = testViewport(0);
+    _ = viewport.fit(.{ .width = 150, .height = 300 });
+    viewport.apply(.half_page_down);
+    _ = viewport.fit(.{ .width = 150, .height = 300 });
+    // Shown: x 0..100, y 100..300.
+    const clipped = viewport.paneRect(.{ .x = 90, .y = 90, .width = 20, .height = 20 }).?;
+    try testing.expectEqual(kitty.Rect{ .x = 90, .y = 0, .width = 10, .height = 10 }, clipped);
+    try testing.expectEqual(null, viewport.paneRect(.{ .x = 0, .y = 0, .width = 100, .height = 100 }));
+    try testing.expectEqual(null, viewport.paneRect(.{ .x = 100, .y = 150, .width = 50, .height = 10 }));
+    try testing.expectEqual(null, viewport.paneRect(.{ .x = 10, .y = 150, .width = 0, .height = 10 }));
 }

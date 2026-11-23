@@ -111,5 +111,7 @@ test {
     _ = @import("PageCache.zig");
     _ = @import("Tty.zig");
     _ = @import("Viewport.zig");
+    _ = @import("clipboard.zig");
+    _ = @import("highlight.zig");
     _ = @import("input.zig");
 }
